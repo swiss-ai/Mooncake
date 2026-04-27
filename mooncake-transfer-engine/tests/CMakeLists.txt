@@ -65,6 +65,12 @@ if (USE_EFA)
     add_test(NAME efa_transport_test COMMAND efa_transport_test)
 endif()
 
+if (USE_CXI)
+    add_executable(cxi_transport_test ${WORKSPACE}/cxi_transport_test.cpp)
+    target_link_libraries(cxi_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME cxi_transport_test COMMAND cxi_transport_test)
+endif()
+
 if (USE_UB)
     add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
     target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main)

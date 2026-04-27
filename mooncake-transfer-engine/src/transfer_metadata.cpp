@@ -78,6 +78,9 @@ struct TransferHandshakeUtil {
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
+#ifdef USE_CXI
+        root["cxi_addr"] = desc.cxi_addr;
+#endif
 
 #ifdef USE_UB
         Json::Value jettyNums(Json::arrayValue);

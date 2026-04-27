@@ -223,7 +223,7 @@ void loadGlobalConfig(GlobalConfig &config) {
     }
 
     const char *log_level = std::getenv("MC_LOG_LEVEL");
-    config.trace = false;
+    config.trace = true;
     if (log_level) {
         if (strcmp(log_level, "TRACE") == 0) {
             config.log_level = google::INFO;
