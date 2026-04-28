@@ -117,8 +117,8 @@ class Transport {
         union {
             struct {
                 uint64_t dest_addr;
-                uint32_t source_lkey;
-                uint32_t dest_rkey;
+                uint64_t source_lkey;
+                uint64_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
                 volatile int *qp_depth;
