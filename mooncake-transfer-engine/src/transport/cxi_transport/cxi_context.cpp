@@ -65,7 +65,11 @@ int CxiContext::construct(size_t num_cq_list, size_t max_cqe,
         return ERR_CONTEXT;
     }
 
-    hints_->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    hints_->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE
+#if defined(USE_CUDA) || defined(USE_HIP)
+                    | FI_HMEM // must be added to the fabric caps to allow cuda/hip on cxi
+#endif
+    ;
     hints_->mode = FI_CONTEXT;
     hints_->ep_attr->type = FI_EP_RDM;  // CXI uses RDM endpoints
     hints_->fabric_attr->prov_name = strdup("cxi");
@@ -73,7 +77,8 @@ int CxiContext::construct(size_t num_cq_list, size_t max_cqe,
     // Specify the domain (device) name - append "-rdm" for RDM endpoint
     std::string domain_name = device_name_;
     // IMPORTANT: FI_MR_ENDPOINT must be specified when using CXI, otherwise fi_getinfo returns ENODATA
-    hints_->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY
+    // CXI does not support FI_MR_VIRT_ADDR, so addresses must be offsets compared to MR base address
+    hints_->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY
 #if defined(USE_CUDA) || defined(USE_HIP)
                                    | FI_MR_HMEM
 #endif
@@ -383,7 +388,7 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_CONTEXT;
     }
     mrMeta.key = fi_mr_key(mrMeta.mr);
-    LOG(INFO) << "cxi mem region @ " << addr << " len: " << length << " key: " << mrMeta.key;
+    // LOG(INFO) << "cxi mem region @ " << addr << " len: " << length << " key: " << mrMeta.key;
     return 0;
 }
 

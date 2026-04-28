@@ -23,6 +23,7 @@
 #include "transfer_engine.h"
 #include "transport/cxi_transport/cxi_transport.h"
 #include "transport/transport.h"
+#include "cuda_alike.h"
 
 using namespace mooncake;
 
@@ -33,6 +34,26 @@ static void *allocateMemoryPool(size_t size, int socket_id) {
 }
 
 static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
+
+#ifdef USE_CUDA
+static void *allocateMemoryPoolDevice(size_t size, int device) {
+    void* devPtr = nullptr;
+    cudaError_t err = cudaMalloc(&devPtr, size);
+    cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "failed to alloc " << size << " bytes on cuda device " << device;
+        return nullptr;
+    }
+    return devPtr;
+}
+
+static void freeMemoryPoolDevice(void *addr) {
+    cudaError_t err = cudaFree(addr);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "failed to free cuda memory @ " << addr; 
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // EFA Transport Test Fixture
@@ -70,6 +91,48 @@ class CXITransportTest : public ::testing::Test {
         size_t buffer_size;
         SegmentID segment_id;
     };
+
+    #ifdef USE_CUDA
+
+    EngineSetup createEngineDevice(size_t buffer_size = 1ull << 30) {
+        EngineSetup s;
+        s.buffer_size = buffer_size;
+
+        s.engine = std::make_unique<TransferEngine>(false);
+        // Manually discover topology to populate EFA device list
+        // (same pattern as the Python binding in transfer_engine_py.cpp)
+        s.engine->getLocalTopology()->discover({});
+        auto hp = parseHostNameWithPort(local_server_name_);
+        int rc = s.engine->init(metadata_server_, local_server_name_,
+                                hp.first.c_str(), hp.second);
+        EXPECT_EQ(rc, 0) << "engine->init failed";
+
+        s.xport = s.engine->installTransport("cxi", nullptr);
+        EXPECT_NE(s.xport, nullptr) << "installTransport(\"cxi\") failed";
+
+        s.addr = allocateMemoryPoolDevice(buffer_size, 0); // allocate mempool on cuda:0
+        EXPECT_NE(s.addr, nullptr) << "allocateMemoryPool failed";
+
+        rc = s.engine->registerLocalMemory(s.addr, buffer_size, "cuda:0");
+        EXPECT_EQ(rc, 0) << "registerLocalMemory failed";
+
+        // Use actual RPC address (P2PHANDSHAKE picks a random port)
+        auto actual_addr = s.engine->getLocalIpAndPort();
+        s.segment_id = s.engine->openSegment(actual_addr);
+        return s;
+    } 
+
+    void destroyEngineDevice(EngineSetup& s) {
+        if (s.engine && s.addr) {
+            s.engine->unregisterLocalMemory(s.addr);
+        }
+        if (s.addr) {
+            freeMemoryPoolDevice(s.addr);
+            s.addr = nullptr;
+        }
+    }
+
+    #endif
 
     EngineSetup createEngine(size_t buffer_size = 1ull << 30) {
         EngineSetup s;
@@ -193,6 +256,31 @@ TEST_F(CXITransportTest, LoopbackWrite) {
     destroyEngine(setup);
 }
 
+#ifdef USE_CUDA
+TEST_F(CXITransportTest, LoopbackWriteDevice) {
+    cudaSetDevice(0);
+    auto setup = createEngineDevice();
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    const size_t kDataLength = 4096;
+
+    // Fill source buffer with known data
+    cudaMemset(setup.addr, 0xAB, kDataLength);
+    cudaDeviceSynchronize();
+
+
+    bool ok = submitAndWait(setup.engine.get(), setup.segment_id, setup.addr,
+                            remote_base, kDataLength, TransferRequest::WRITE);
+    EXPECT_TRUE(ok) << "Loopback write should succeed";
+
+    destroyEngineDevice(setup);
+}
+#endif
+
 // Test 3: Write then read, verify data integrity
 TEST_F(CXITransportTest, WriteAndRead) {
     auto setup = createEngine();
@@ -224,6 +312,45 @@ TEST_F(CXITransportTest, WriteAndRead) {
 
     destroyEngine(setup);
 }
+
+
+#ifdef USE_CUDA
+TEST_F(CXITransportTest, WriteAndReadDevice) {
+    cudaSetDevice(0);
+    auto setup = createEngineDevice();
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    const size_t kDataLength = 4096000;
+    uint8_t *buf = (uint8_t *)setup.addr;
+
+    uint8_t random_data = 'a' + lrand48() % 26;
+    cudaMemset(buf, random_data, kDataLength);
+    cudaDeviceSynchronize();
+
+    // Write local -> remote (loopback)
+    bool ok = submitAndWait(setup.engine.get(), setup.segment_id, buf,
+                            remote_base, kDataLength, TransferRequest::WRITE);
+    ASSERT_TRUE(ok) << "Write should succeed";
+
+    // Read remote -> local (into second half of buffer)
+    ok = submitAndWait(setup.engine.get(), setup.segment_id, buf + kDataLength,
+                       remote_base, kDataLength, TransferRequest::READ);
+    ASSERT_TRUE(ok) << "Read should succeed";
+    // copy data back to host
+    uint8_t* dataHost = (uint8_t*) allocateMemoryPool(2 * kDataLength, 0);
+    cudaMemcpy(dataHost, buf, 2 * kDataLength, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    // Verify data integrity
+    EXPECT_EQ(0, memcmp(dataHost, dataHost + kDataLength, kDataLength))
+        << "Read-back data should match written data";
+
+    destroyEngineDevice(setup);
+}
+#endif
 
 // Test 4: Multiple sequential writes in a batch
 TEST_F(CXITransportTest, MultiWrite) {

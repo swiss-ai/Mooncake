@@ -67,7 +67,9 @@ endif()
 
 if (USE_CXI)
     add_executable(cxi_transport_test ${WORKSPACE}/cxi_transport_test.cpp)
+    add_executable(cxi_transfer_test ${WORKSPACE}/cxi_transfer_test.cpp)
     target_link_libraries(cxi_transport_test PUBLIC transfer_engine gtest gtest_main)
+    target_link_libraries(cxi_transfer_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME cxi_transport_test COMMAND cxi_transport_test)
 endif()
 

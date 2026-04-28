@@ -106,6 +106,10 @@ struct TransferHandshakeUtil {
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
 #endif
 
+#ifdef USE_CXI
+        desc.cxi_addr = root["cxi_addr"].asString();
+#endif
+
 #ifdef USE_UB
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
@@ -309,7 +313,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
     if (segmentJSON["protocol"] == "rdma" ||
         segmentJSON["protocol"] == "barex" ||
-        segmentJSON["protocol"] == "efa") {
+        segmentJSON["protocol"] == "efa" || 
+        segmentJSON["protocol"] == "cxi") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -643,7 +648,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->timestamp = segmentJSON["timestamp"].asString();
 
     if (desc->protocol == "rdma" || desc->protocol == "barex" ||
-        desc->protocol == "efa") {
+        desc->protocol == "efa" || desc->protocol == "cxi") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -663,9 +668,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
+                buffer.rkey.push_back(rkeyJSON.asUInt64());
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.lkey.push_back(lkeyJSON.asUInt64());
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
