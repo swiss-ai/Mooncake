@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// EFA multi-NIC transfer test: register 200x2GB on all NICs, then transfer.
+// CXI multi-NIC transfer test
 //
-// Target node: allocate 200x2GB buffers, register on all NICs, wait.
+// Target node: allocate buffers, register on all NICs, wait.
 // Initiator node: allocate receive buffer, register, pull from target.
 //
 // Usage:
 //   # Target (holds KV cache):
 //   ./cxi_transfer_test --mode target --server <target_ip>:12345 \
-//       --num_bufs 200 --buf_size_gb 2
+//       --num_bufs 4 --buf_size_gb 1
 //
 //   # Initiator (pulls data):
 //   ./cxi_transfer_test --mode initiator --server <initiator_ip>:12346 \
-//       --target <target_ip>:12345 --num_bufs 200 --buf_size_gb 2 \
+//       --target <target_ip>:12345 --num_bufs 4 --buf_size_gb 1 \
 //       --transfer_mb 368
 
 #include <gflags/gflags.h>
@@ -41,8 +41,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <numaif.h>
 
 #include "transfer_engine.h"
+#include "transport/cxi_transport/cxi_transport.h"
+
+#ifdef USE_CUDA
+#include <cuda_alike.h>
+#endif
 
 using namespace mooncake;
 
@@ -59,6 +65,7 @@ DEFINE_int32(warmup, 5, "Number of warmup iterations");
 DEFINE_int32(batch_size, 1, "Batch size for each transfer submission");
 DEFINE_int32(threads, 1, "Number of initiator worker threads");
 DEFINE_uint64(block_size, 65536, "Block size for transfer requests (64KB)");
+DEFINE_bool(use_device, false, "Use CUDA device memory for transfer");
 
 static std::atomic<bool> g_running(true);
 
@@ -75,7 +82,7 @@ static void setupSignalHandler() {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
-static void* allocateHugepage(size_t size) {
+static void* allocateHugepage(size_t size, int node_id) {
     void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     if (buf == MAP_FAILED) {
@@ -85,8 +92,61 @@ static void* allocateHugepage(size_t size) {
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (buf == MAP_FAILED) return nullptr;
     }
+    unsigned long nodemask = 1UL << node_id;
+
+    mbind(buf, size,
+        MPOL_BIND,
+        &nodemask,
+        /* maxnode */ sizeof(nodemask) * 8,
+        0);
     return buf;
 }
+
+
+
+#ifdef USE_CUDA
+    static constexpr bool can_use_device = true;
+
+    static void* allocateDevice(size_t size, int device) {
+        cudaSetDevice(device);
+        void* buf = nullptr;
+        cudaError_t err = cudaMalloc(&buf, size);
+        if (err != cudaSuccess) {
+            return nullptr;
+        }
+        return buf;
+    }
+
+    static int setDeviceMem(void* buf, size_t size, int device, int val) {
+        cudaSetDevice(device);
+        cudaError_t err = cudaMemset(buf, val, size);
+        if (err != cudaSuccess) {
+            return -1;
+        }
+        return 0;
+    }
+
+    static bool checkDeviceMem(void* buf, int device, uint8_t expected) {
+        cudaSetDevice(device);
+        uint8_t actual;
+        size_t offset = 42;
+        cudaError_t err = cudaMemcpy(&actual, buf + offset, 1, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+            return false; 
+        return expected == actual;
+    }
+
+    static int freeDeviceMem(void* buf, int device) {
+        cudaSetDevice(device);
+        cudaError_t err = cudaFree(buf);
+        if (err != cudaSuccess)
+            return -1;
+        return 0;
+    }
+
+#else 
+    static constexpr bool can_use_device = false;
+#endif
 
 static int runTarget(TransferEngine* engine) {
     size_t buf_bytes =
@@ -102,12 +162,41 @@ static int runTarget(TransferEngine* engine) {
     bufs.reserve(num_bufs);
     LOG(INFO) << "Allocating " << num_bufs << " buffers...";
     for (int i = 0; i < num_bufs; ++i) {
-        void* buf = allocateHugepage(buf_bytes);
-        if (!buf) {
-            LOG(ERROR) << "Allocation failed at buffer " << i;
-            for (auto* p : bufs) munmap(p, buf_bytes);
-            return 1;
+        void* buf;
+        if (!FLAGS_use_device) {
+            buf = allocateHugepage(buf_bytes, 0);
+            if (!buf) {
+                LOG(ERROR) << "Allocation failed at buffer " << i;
+                for (auto* p : bufs) munmap(p, buf_bytes);
+                return 1;
+            }
+            buf = memset(buf, (uint8_t) 42, buf_bytes);
+            if (!buf) {
+                LOG(ERROR) << "Memset failed at buffer " << i;
+                for (auto* p : bufs) munmap(p, buf_bytes);
+                return 1;
+            }
+        } else {
+#ifdef USE_CUDA 
+            int buf_device = i % 4;
+            buf = allocateDevice(buf_bytes, buf_device);
+            if (!buf) {
+                LOG(ERROR) << "allocation failed at buffer " << i;
+                for (int j = 0; j < i; j++) {
+                    freeDeviceMem(bufs[j], j % 4);
+                }
+                return 1;
+            }
+            if (setDeviceMem(buf, buf_bytes, buf_device, 42) != 0) {
+                LOG(ERROR) << "failed to set memory for buffer " << i;
+                for (int j = 0; j < i; j++) {
+                    freeDeviceMem(bufs[j], j % 4);
+                }
+                return 1;
+            }
+#endif
         }
+
         bufs.push_back(buf);
         if ((i + 1) % 50 == 0 || i == num_bufs - 1)
             LOG(INFO) << "  allocated " << (i + 1) << "/" << num_bufs;
@@ -139,6 +228,7 @@ static int runTarget(TransferEngine* engine) {
     LOG(INFO) << "Target ready. First buffer at " << bufs[0]
               << ". Waiting for initiator (Ctrl+C to stop)...";
 
+    if (FLAGS_use_device) cudaSetDevice(0);
     while (g_running) sleep(1);
 
     LOG(INFO) << "Shutting down target...";
@@ -187,12 +277,32 @@ static int runInitiator(TransferEngine* engine) {
     size_t recv_bytes = transfer_bytes;
     std::vector<void*> recv_bufs(FLAGS_threads);
     for (int t = 0; t < FLAGS_threads; ++t) {
-        recv_bufs[t] = allocateHugepage(recv_bytes);
-        if (!recv_bufs[t]) {
-            LOG(ERROR) << "Failed to allocate receive buffer for thread " << t;
-            return 1;
+        if (!FLAGS_use_device) {
+            recv_bufs[t] = allocateHugepage(recv_bytes, 0);
+            if (!recv_bufs[t]) {
+                LOG(ERROR) << "Failed to allocate receive buffer for thread " << t;
+                return 1;
+            }
+            recv_bufs[t] = memset(recv_bufs[t], 66, recv_bytes);
+            if (!recv_bufs[t]) {
+                LOG(ERROR) << "Failed to memset receive buffer for thread " << t;
+                return 1;
+            }
+        } else {
+#ifdef USE_CUDA
+            int tid_device = t % 4;
+            recv_bufs[t] = allocateDevice(recv_bytes, tid_device);
+            if (!recv_bufs[t]) {
+                LOG(ERROR) << "Failed to allocate receive buffer for thread " << t;
+                return 1;
+            }
+            if (setDeviceMem(recv_bufs[t], recv_bytes, tid_device, 66) != 0) {
+                LOG(ERROR) << "Failed to set data on receive buffer for thread " << t;
+            }
+#endif
         }
-        int ret = engine->registerLocalMemory(recv_bufs[t], recv_bytes, "cpu:0",
+
+        int ret = engine->registerLocalMemory(recv_bufs[t], recv_bytes, "*",
                                               true);
         if (ret != 0) {
             LOG(ERROR) << "Failed to register receive buffer: " << ret;
@@ -246,6 +356,7 @@ static int runInitiator(TransferEngine* engine) {
                 return 1;
             }
         }
+        if (recv_bufs[0])
         engine->freeBatchID(batch_id);
     }
     LOG(INFO) << "Connection ready.";
@@ -263,8 +374,8 @@ static int runInitiator(TransferEngine* engine) {
     auto workerFn = [&](int tid, int warmup_iters, int bench_iters,
                         ThreadResult* result) {
         void* my_recv = recv_bufs[tid];
+        size_t buf_idx = (tid + 1) % num_remote_bufs; // one thread <-> one buffer
         for (int w = 0; w < warmup_iters; ++w) {
-            size_t buf_idx = (tid + w * FLAGS_threads) % num_remote_bufs;
             uint64_t raddr = segment_desc->buffers[buf_idx].addr;
             size_t rlen = segment_desc->buffers[buf_idx].length;
             size_t xfer = std::min(transfer_bytes, rlen);
@@ -276,6 +387,7 @@ static int runInitiator(TransferEngine* engine) {
             req.target_id = segment_id;
             req.target_offset = raddr;
             req.length = xfer;
+
             engine->submitTransfer(bid, {req});
             while (true) {
                 TransferStatus st;
@@ -288,7 +400,6 @@ static int runInitiator(TransferEngine* engine) {
         }
 
         for (int i = 0; i < bench_iters; ++i) {
-            size_t buf_idx = (tid + i * FLAGS_threads) % num_remote_bufs;
             uint64_t raddr = segment_desc->buffers[buf_idx].addr;
             size_t rlen = segment_desc->buffers[buf_idx].length;
             size_t xfer = std::min(transfer_bytes, rlen);
@@ -316,6 +427,7 @@ static int runInitiator(TransferEngine* engine) {
                     break;
                 }
                 if (st.s == TransferStatusEnum::FAILED) {
+                    LOG(ERROR) << "thread " << tid << " has failed the transfer\n";
                     result->errors++;
                     break;
                 }
@@ -389,8 +501,25 @@ static int runInitiator(TransferEngine* engine) {
 
     // Cleanup
     for (int t = 0; t < FLAGS_threads; ++t) {
-        engine->unregisterLocalMemory(recv_bufs[t]);
-        munmap(recv_bufs[t], recv_bytes);
+        if (!FLAGS_use_device) {
+            if (((uint8_t* )recv_bufs[t])[66] != 42) {
+                LOG(ERROR) << "transfer has corrupted data, expected to find 42 but found " << ((int) ((uint8_t*) recv_bufs[t])[66]);
+            } else {
+                LOG(INFO) << "transfer was successful";
+            }
+            engine->unregisterLocalMemory(recv_bufs[t]);
+            munmap(recv_bufs[t], recv_bytes);
+        } else {
+#ifdef USE_CUDA
+            bool result = checkDeviceMem(recv_bufs[t], t % 4, 42);
+            if (!result) {
+                LOG(ERROR) << "transfer has corrupted data, expected to find 42";
+            } else {
+                LOG(INFO) << "transfer was successful\n";
+            }
+            freeDeviceMem(recv_bufs[t], t % 4);
+#endif
+        }
     }
     return total_errors > 0 ? 1 : 0;
 }
@@ -401,6 +530,15 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = 1;
 
     setupSignalHandler();
+
+    if (FLAGS_use_device && !can_use_device) {
+        LOG(ERROR) << "Cannot use device memory, recompile with cmake -DUSE_CUDA!";
+        return 1;
+    } 
+
+    if (FLAGS_use_device) {
+        LOG(INFO) << "Using device memory";
+    }
 
     if (FLAGS_server.empty()) {
         LOG(ERROR) << "--server is required";

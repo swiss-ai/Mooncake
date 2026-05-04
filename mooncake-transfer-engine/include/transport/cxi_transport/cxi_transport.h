@@ -38,6 +38,13 @@ class CxiContext;
 class CxiEndpoint;
 class TransferMetadata;
 
+enum NicReplicaPolicy {
+    REPLICATE_ALL,
+    NUMA_AWARE,
+    DEBUG
+};
+
+
 class CxiTransport : public Transport {
     friend class CxiContext;
     friend class CxiEndpoint;
@@ -107,6 +114,8 @@ class CxiTransport : public Transport {
                              TransferStatus& status) override;
 
     SegmentID getSegmentID(const std::string& segment_name);
+
+    NicReplicaPolicy getReplicaPolicy();
 
    private:
     int allocateLocalSegmentID();

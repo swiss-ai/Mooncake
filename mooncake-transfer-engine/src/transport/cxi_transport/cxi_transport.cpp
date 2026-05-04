@@ -39,59 +39,12 @@
 
 namespace mooncake {
 
-// Default PTE (page table entry) limit per EFA NIC.  EFA hardware supports
-// roughly 24 million PTEs per NIC, but we use 22M as a conservative default.
-// With 4KB pages: 22M × 4KB ≈ 88GB per NIC.
-// With 2MB hugepages: 22M × 2MB ≈ 44TB per NIC (effectively unlimited).
-// Override via MC_EFA_MAX_PTE_ENTRIES environment variable.
-static constexpr size_t kDefaultMaxPteEntries = 22ULL * 1024 * 1024;  // 22M
-
-// Detect the kernel page size backing the memory at `addr` by reading
-// /proc/self/smaps.  Falls back to sysconf(_SC_PAGESIZE) on any failure.
-static size_t detectBufferPageSize(void* addr) {
-    size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    std::ifstream smaps("/proc/self/smaps");
-    if (!smaps.is_open()) return fallback;
-
-    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    std::string line;
-    bool in_range = false;
-
-    while (std::getline(smaps, line)) {
-        // VMA header: "start-end perms offset dev inode [pathname]"
-        if (!line.empty() && std::isxdigit(line[0])) {
-            unsigned long start = 0, end = 0;
-            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
-                in_range = (target >= start && target < end);
-            }
-        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
-            unsigned long kb = 0;
-            if (sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
-                kb > 0) {
-                return kb * 1024;
-            }
-        }
-    }
-    return fallback;
-}
-
-static size_t getMaxPteEntries() {
-    static size_t cached = []() {
-        const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
-        if (env) {
-            size_t val = std::stoull(env);
-            if (val > 0) {
-                LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
-                return val;
-            }
-        }
-        return kDefaultMaxPteEntries;
-    }();
-    return cached;
+NicReplicaPolicy CxiTransport::getReplicaPolicy() {
+    return NicReplicaPolicy::NUMA_AWARE;
 }
 
 CxiTransport::CxiTransport() {
-    LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
+    LOG(INFO) << "[CXI] CXI Slingshot transport initialized";
 }
 
 CxiTransport::~CxiTransport() {
@@ -142,6 +95,9 @@ void CxiTransport::workerThreadFunc(int thread_id) {
             for (size_t cq_idx = 0; cq_idx < context->cqCount(); cq_idx++) {
                 int completed = context->pollCq(kPollBatchSize, cq_idx);
                 if (completed > 0) {
+                    if (cq_idx != 0) {
+                        LOG(INFO) << "polled from cq different from 0 WTF?";
+                    }
                     did_work = true;
                 }
             }
@@ -173,7 +129,7 @@ int CxiTransport::install(std::string& local_server_name,
 
     auto ret = initializeCxiResources();
     if (ret) {
-        LOG(ERROR) << "CxiTransport: cannot initialize EFA resources";
+        LOG(ERROR) << "CxiTransport: cannot initialize CXI resources";
         return ret;
     }
 
@@ -256,26 +212,14 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     (void)remote_accessible;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
+                                  IBV_ACCESS_REMOTE_READ; // this is not used, ignore
 
     int access_rights = kBaseAccessRights;
     size_t max_mr = (size_t)globalConfig().max_mr_size;
 
-    // Compute chunk limit based on EFA PTE (page table entry) constraints.
-    // Each EFA NIC has a hardware limit on PTE entries (~24M).  The effective
-    // per-NIC MR size limit depends on the backing page size:
-    //   4KB pages  → 22M × 4KB  ≈ 88GB  (smaller than device max_mr_size)
-    //   2MB hugepg → 22M × 2MB  ≈ 44TB  (device max_mr_size is the limit)
-    // We detect the actual page size of the buffer and compute accordingly,
-    // so hugepage-backed memory avoids unnecessary splitting.
-    size_t page_size = detectBufferPageSize(addr);
-    size_t pte_limit = getMaxPteEntries() * page_size;
-    // When max_mr_size is not configured, fall back to pte_limit so that
-    // PTE-aware splitting still kicks in for large buffers on 4KB pages.
-    size_t chunk_limit = (max_mr > 0) ? std::min(max_mr, pte_limit) : pte_limit;
-    LOG(INFO) << "Auto-split params: page_size=" << page_size
-              << ", max_pte_entries=" << getMaxPteEntries()
-              << ", pte_limit=" << pte_limit << ", max_mr_size=" << max_mr
+    // max_mr must be set, slingshot handles mempages differently compared to efa
+    size_t chunk_limit = max_mr;
+    LOG(INFO) << "Auto-split params: max_mr_size=" << max_mr
               << ", chunk_limit=" << chunk_limit;
 
     // Determine chunk boundaries
@@ -299,93 +243,36 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     if (name == kWildcardLocation) {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page);
+            getMemoryLocation(addr, length, only_first_page); // check only first page
         if (entries.empty()) return -1;
         resolved_name = entries[0].location;
     } else {
         resolved_name = name;
     }
 
-    // Pre-compute NIC assignments for each chunk.
-    // Strategy: if total PTE usage per NIC fits within the PTE budget,
-    // register ALL chunks on ALL NICs (full coverage → max throughput).
-    // Otherwise fall back to disjoint per-NIC partition.
     size_t num_nics = context_list_.size();
     size_t num_chunks = chunks.size();
-    size_t total_pages_per_nic = length / page_size;
-    bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries());
+
+    auto policy = getReplicaPolicy();
 
     std::vector<std::vector<size_t>> nic_assignments(num_chunks);
-    if (chunks.size() <= 1) {
-        // Single chunk: all NICs
-        for (size_t n = 0; n < num_nics; ++n) {
-            nic_assignments[0].push_back(n);
-        }
-    } else if (use_full_coverage) {
-        // Multi-chunk, PTE budget OK: every chunk on every NIC
-        LOG(WARNING) << "Full NIC coverage: " << num_chunks << " chunks × "
-                     << num_nics
-                     << " NICs (total PTE/NIC=" << total_pages_per_nic
-                     << ", budget=" << getMaxPteEntries() << ")";
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            for (size_t n = 0; n < num_nics; ++n) {
-                nic_assignments[ci].push_back(n);
-            }
-        }
-    } else if (num_chunks <= num_nics) {
-        // Multi-chunk, PTE exceeded, more NICs than chunks: disjoint partition
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            size_t nics_per = num_nics / num_chunks;
-            size_t extra = num_nics % num_chunks;
-            size_t start = ci * nics_per + std::min(ci, extra);
-            size_t count = nics_per + (ci < extra ? 1 : 0);
-            for (size_t n = start; n < start + count; ++n) {
-                nic_assignments[ci].push_back(n);
-            }
-        }
-        LOG(WARNING) << "Disjoint NIC partition: PTE/NIC="
-                     << total_pages_per_nic
-                     << " exceeds budget=" << getMaxPteEntries();
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            std::string nic_list;
-            for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
-                if (j > 0) nic_list += ",";
-                nic_list += std::to_string(nic_assignments[ci][j]);
-            }
-            LOG(WARNING) << "  chunk " << ci << " -> NICs [" << nic_list << "]";
-        }
-    } else {
-        // Multi-chunk, PTE exceeded, more chunks than NICs: round-robin
-        // Each NIC gets multiple chunks; verify per-NIC PTE stays in budget.
-        size_t pte_budget = getMaxPteEntries();
-        std::vector<size_t> pages_per_nic(num_nics, 0);
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            size_t nic = ci % num_nics;
-            size_t chunk_pages = chunks[ci].second / page_size;
-            pages_per_nic[nic] += chunk_pages;
-            nic_assignments[ci].push_back(nic);
-        }
-        bool pte_ok = true;
-        for (size_t n = 0; n < num_nics; ++n) {
-            if (pages_per_nic[n] > pte_budget) {
-                pte_ok = false;
+    int numa_node = std::stoi(resolved_name.substr(resolved_name.find(':') + 1));
+    LOG(INFO) << "numa node for this allocation is " << numa_node;
+
+    // implicit assumption here, the address and relative chunks all lie in the same numa node
+    for (size_t ci = 0; ci < num_chunks; ci++) {
+        // based on replication policy, assign chunk to nic
+        switch(policy) {
+            case NUMA_AWARE:
+                nic_assignments[ci].push_back(numa_node);
                 break;
-            }
-        }
-        if (!pte_ok) {
-            LOG(ERROR) << "Buffer requires " << num_chunks << " chunks ("
-                       << length << " bytes) but per-NIC PTE budget ("
-                       << pte_budget << " entries, page_size=" << page_size
-                       << ") is exceeded even with round-robin across "
-                       << num_nics << " NICs";
-            return ERR_INVALID_ARGUMENT;
-        }
-        LOG(WARNING) << "Round-robin NIC assignment: " << num_chunks
-                     << " chunks across " << num_nics << " NICs";
-        for (size_t ci = 0; ci < num_chunks; ++ci) {
-            LOG(WARNING) << "  chunk " << ci << " ("
-                         << chunks[ci].second / (1024 * 1024) << " MB) -> NIC "
-                         << nic_assignments[ci][0];
+            case REPLICATE_ALL:
+                for (size_t nic_idx = 0; nic_idx < num_nics; nic_idx++)
+                    nic_assignments[ci].push_back(nic_idx);
+                break;
+            default:
+                nic_assignments[ci].push_back(0); // register everything to nic 0
+                break;
         }
     }
 
@@ -402,6 +289,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void* chunk_addr = chunks[ci].first;
         size_t chunk_len = chunks[ci].second;
+        
         const auto& assigned_nics = nic_assignments[ci];
 
         // preTouchMemory does a CPU-side store to each page, which segfaults
@@ -451,7 +339,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 if (ret_codes[j] != 0) {
                     LOG(ERROR)
                         << "Failed to register memory region chunk " << ci
-                        << " with EFA context " << assigned_nics[j];
+                        << " with CXI context " << assigned_nics[j];
                     rollbackChunks(ci);
                     return ret_codes[j];
                 }
@@ -462,7 +350,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
                     chunk_addr, chunk_len, access_rights);
                 if (ret) {
                     LOG(ERROR) << "Failed to register memory region chunk "
-                               << ci << " with EFA context " << nic_idx;
+                               << ci << " with CXI context " << nic_idx;
                     rollbackChunks(ci);
                     return ret;
                 }
@@ -476,7 +364,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 .count();
 
         if (globalConfig().trace) {
-            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
+            LOG(INFO) << "CXI registerMemoryRegion: chunk " << ci
                       << ", addr=" << chunk_addr << ", length=" << chunk_len
                       << ", nics=" << assigned_nics.size() << "/"
                       << context_list_.size()
@@ -552,7 +440,7 @@ int CxiTransport::unregisterLocalMemoryInternal(void* addr,
                 int ret = context_list_[nic_idx]->unregisterMemoryRegion(ca);
                 if (ret) {
                     LOG(ERROR) << "Failed to unregister chunk " << ca
-                               << " with EFA context " << nic_idx;
+                               << " with CXI context " << nic_idx;
                     return ret;
                 }
             }
@@ -590,7 +478,7 @@ int CxiTransport::unregisterLocalMemoryInternal(void* addr,
         for (size_t i = 0; i < ret_codes.size(); ++i) {
             if (ret_codes[i] != 0) {
                 LOG(ERROR)
-                    << "Failed to unregister memory region with EFA context "
+                    << "Failed to unregister memory region with CXI context "
                     << i;
                 return ret_codes[i];
             }
@@ -600,7 +488,7 @@ int CxiTransport::unregisterLocalMemoryInternal(void* addr,
             int ret = context_list_[i]->unregisterMemoryRegion(addr);
             if (ret) {
                 LOG(ERROR)
-                    << "Failed to unregister memory region with EFA context "
+                    << "Failed to unregister memory region with CXI context "
                     << i;
                 return ret;
             }
@@ -817,10 +705,10 @@ Status CxiTransport::submitTransferTask(
             // handled by selectDevice above.
             auto& context = context_list_[request_device_id];
             if (!context || !context->active()) {
-                LOG(ERROR) << "EFA Device " << request_device_id
+                LOG(ERROR) << "CXI Device " << request_device_id
                            << " is not active";
                 return Status::InvalidArgument(
-                    "EFA Device " + std::to_string(request_device_id) +
+                    "CXI Device " + std::to_string(request_device_id) +
                     " is not active");
             }
 
@@ -868,13 +756,13 @@ Status CxiTransport::submitTransferTask(
                 }
             }
             if (!found_device) {
-                LOG(ERROR) << "Memory region not registered by any active EFA "
+                LOG(ERROR) << "Memory region not registered by any active CXI "
                               "device(s): "
                            << request.source;
                 for (auto& entry : slices_to_post)
                     for (auto s : entry.second) s->markFailed();
                 return Status::AddressNotRegistered(
-                    "Memory region not registered by any active EFA "
+                    "Memory region not registered by any active CXI "
                     "device(s): " +
                     std::to_string(
                         reinterpret_cast<uintptr_t>(request.source)));
@@ -971,7 +859,7 @@ int CxiTransport::onSetupCxiConnections(const HandShakeDesc& peer_desc,
     if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
 
     // Find context by device name instead of using hca_list index, since
-    // context_list_ only contains EFA devices and may have different
+    // context_list_ only contains CXI devices and may have different
     // indexing than the full hca_list.
     std::shared_ptr<CxiContext> context;
     for (auto& entry : context_list_) {
@@ -990,7 +878,7 @@ int CxiTransport::onSetupCxiConnections(const HandShakeDesc& peer_desc,
 int CxiTransport::initializeCxiResources() {
     auto hca_list = local_topology_->getHcaList();
 
-    // Filter for EFA devices (names typically start with "rdmap" on AWS)
+    // Filter for CXI devices (names typically start with "rdmap" on AWS)
     std::vector<std::string> efa_devices;
     std::vector<std::string> non_efa_devices;
     for (auto& device_name : hca_list) {
@@ -1002,20 +890,16 @@ int CxiTransport::initializeCxiResources() {
     }
 
     if (efa_devices.empty()) {
-        LOG(WARNING) << "CxiTransport: No EFA devices found, falling back to "
+        LOG(WARNING) << "CxiTransport: No CXI devices found, falling back to "
                         "all devices";
         efa_devices = hca_list;
         non_efa_devices.clear();
     }
 
-    // Disable non-EFA devices (e.g. ibp* IB devices) in the topology so that
-    // topology device indices stay aligned with context_list_ indices.
-    // Without this, selectDevice() can return an index from the full topology
-    // (which includes non-EFA devices), causing out-of-bounds access on
-    // context_list_ which only contains EFA devices.
+    // Disable non-CXI devices
     for (auto& device_name : non_efa_devices) {
         local_topology_->disableDevice(device_name);
-        LOG(INFO) << "CxiTransport: Disabled non-EFA device " << device_name
+        LOG(INFO) << "CxiTransport: Disabled non-CXI device " << device_name
                   << " in topology";
     }
 
@@ -1029,45 +913,13 @@ int CxiTransport::initializeCxiResources() {
             LOG(WARNING) << "CxiTransport: Disable device " << device_name;
         } else {
             context_list_.push_back(context);
-            LOG(INFO) << "CxiTransport: Initialized EFA device " << device_name;
+            LOG(INFO) << "CxiTransport: Initialized CXI device " << device_name;
         }
     }
     if (context_list_.empty()) {
-        LOG(ERROR) << "CxiTransport: No available EFA devices";
+        LOG(ERROR) << "CxiTransport: No available CXI devices";
         return ERR_DEVICE_NOT_FOUND;
     }
-
-    // Query EFA device max_mr_size via ibverbs and clamp globalConfig.
-    // libfabric does not expose max_mr_size, so we go through the ibverbs
-    // layer.
-    // {
-    //     int num_devices = 0;
-    //     struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
-    //     if (dev_list) {
-    //         const std::string& first_efa = efa_devices[0];
-    //         for (int i = 0; i < num_devices; ++i) {
-    //             if (first_efa == ibv_get_device_name(dev_list[i])) {
-    //                 struct ibv_context* ctx = ibv_open_device(dev_list[i]);
-    //                 if (ctx) {
-    //                     struct ibv_device_attr attr;
-    //                     if (ibv_query_device(ctx, &attr) == 0) {
-    //                         auto& config = globalConfig();
-    //                         if (config.max_mr_size >
-    //                             (uint64_t)attr.max_mr_size) {
-    //                             config.max_mr_size = attr.max_mr_size;
-    //                             LOG(INFO) << "CxiTransport: Clamped "
-    //                                          "max_mr_size to device limit: "
-    //                                       << config.max_mr_size;
-    //                         }
-    //                     }
-    //                     ibv_close_device(ctx);
-    //                 }
-    //                 break;
-    //             }
-    //         }
-    //         ibv_free_device_list(dev_list);
-    //     }
-    // }
 
     return 0;
 }
@@ -1094,11 +946,10 @@ int CxiTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             continue;
         }
 
-        // Try multiple attempts to find a device with valid MR registration.
-        // With per-NIC partition, not all devices have all buffers registered,
-        // so rkey[device_id] may be 0 for unassigned NICs.
         int num_devices = static_cast<int>(desc->devices.size());
-        for (int attempt = 0; attempt < num_devices; ++attempt) {
+        // this must be <=, because the first attempt will be random, so to guarantee that the device
+        // is found we need num_device+1 attempts
+        for (int attempt = 0; attempt <= num_devices; ++attempt) {
             int try_count = retry_count + attempt;
             device_id =
                 hint.empty()

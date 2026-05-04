@@ -329,6 +329,7 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
     // iface/device fields (per libfabric spec and EFA provider impl).
     enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
     int device_ordinal = 0;
+    int current_device = 0;
 
 #if defined(USE_CUDA)
     cudaPointerAttributes attributes;
@@ -336,6 +337,8 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (cuda_ret == cudaSuccess && attributes.type == cudaMemoryTypeDevice) {
         iface = FI_HMEM_CUDA;
         device_ordinal = attributes.device;
+        cudaGetDevice(&current_device);
+        cudaSetDevice(device_ordinal); // if by any chance we are setting a device pointer from a different device, fi_mr_regattr will fail
     }
 #elif defined(USE_HIP)
     hipPointerAttribute_t attributes;
@@ -364,6 +367,10 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
                        << "): " << fi_strerror(-ret);
             return ERR_CONTEXT;
         }
+        #ifdef USE_CUDA 
+            cudaSetDevice(current_device);
+        #endif
+
     } else {
         // CPU memory: fi_mr_reg is sufficient
         ret = fi_mr_reg(domain_, addr, length, fi_access, 0, 0, 0, &mrMeta.mr,
@@ -376,7 +383,6 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
     }
 
     // cxi requires FI_MR_ENDPOINT
-    
     ret = fi_mr_bind(mrMeta.mr, &shared_ep_->fid, 0);
     if (ret) {
         LOG(ERROR) << "fi_mr_bind failed for " << addr << ": " << fi_strerror(-ret);
@@ -635,21 +641,19 @@ int CxiContext::submitPostSend(
         if (CxiTransport::selectDevice(peer_segment_desc.get(),
                                        slice->rdma.dest_addr, slice->length,
                                        buffer_id, device_id)) {
+
             LOG(ERROR) << "Cannot select device for dest_addr "
                        << (void*)slice->rdma.dest_addr;
             slice->markFailed();
             continue;
         }
+        LOG(INFO) << "for transfer selected device " << device_id; 
 
-        // std::cout << "submitting... " << peer_segment_desc->buffers[buffer_id].addr << " " << peer_segment_desc->buffers[buffer_id].offset << "\n";
+
+        // no FI_VIRT_ADDR support on slingshot, must be offset of memory region
         slice->rdma.dest_addr -= peer_segment_desc->buffers[buffer_id].addr;
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
-        // for (int i = 0; i < peer_segment_desc->buffers[buffer_id].rkey.size(); i++) {
-        //     auto key = peer_segment_desc->buffers[buffer_id].rkey[i];
-        //     std::cout << "rkey: " << key << " device " << i << " req_device " << device_id << "\n";
-        // }
-        // std::cout << "slice dest key: " << slice->rdma.dest_rkey << "\n";
 
         std::string peer_nic_path = peer_segment_desc->name + "@" +
                                     peer_segment_desc->devices[device_id].name;
@@ -775,7 +779,7 @@ int CxiContext::submitSlicesOnPeer(
         }
 
         if (timed_out) {
-            LOG(WARNING) << "EFA submitSlicesOnPeer: timed out waiting for CQ"
+            LOG(WARNING) << "CXI submitSlicesOnPeer: timed out waiting for CQ"
                          << " drain (wr_depth="
                          << wr_depth_.load(std::memory_order_relaxed)
                          << ", max=" << max_wr_depth_ << ", cq_outstanding="
@@ -922,7 +926,7 @@ int CxiContext::pollCq(int max_entries, int cq_index) {
             CxiOpContext* op_ctx =
                 reinterpret_cast<CxiOpContext*>(err_entry.op_context);
             if (op_ctx && op_ctx->slice) {
-                LOG(ERROR) << "EFA CQ error: "
+                LOG(ERROR) << "CXI CQ error: "
                            << fi_cq_strerror(cq, err_entry.prov_errno,
                                              err_entry.err_data, nullptr, 0)
                            << " for slice at " << op_ctx->slice->source_addr;

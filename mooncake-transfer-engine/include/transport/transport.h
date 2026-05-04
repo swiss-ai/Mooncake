@@ -111,7 +111,7 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
-        std::vector<uint32_t> dest_rkeys;
+        std::vector<uint64_t> dest_rkeys;
         bool from_cache;
 
         union {
