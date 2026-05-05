@@ -144,6 +144,7 @@ struct InfinibandDevice {
 
 static std::vector<InfinibandDevice> listInfiniBandDevices(
     const std::vector<std::string> &filter) {
+#ifndef USE_CXI
     int num_devices = 0;
     std::vector<InfinibandDevice> devices;
 
@@ -194,10 +195,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     }
     ibv_free_device_list(device_list);
     return devices;
-}
-
-static std::vector<InfinibandDevice> listCxiDevices()
-{
+#else 
     // assume devices available and working, later use libcxi to check if they actually work
     std::vector<std::string> device_names;
     std::vector<InfinibandDevice> devices;
@@ -218,13 +216,15 @@ static std::vector<InfinibandDevice> listCxiDevices()
     }
 
     for (auto& dv_name : device_names) {
+        if (!filter.empty() && std::find(filter.begin(), filter.end(), dv_name) == filter.end())
+            continue;
 
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
 
         snprintf(path, sizeof(path), "/sys/class/cxi/%s/device", dv_name.c_str());
         if (realpath(path, resolved_path) == NULL) {
-            std::cout << "error! Can't resolve CXI device path for " << path << "\n";
+            PLOG(ERROR) << "Can't resolve CXI device path for " << path;
         }
         std::string pci_bus_id = basename(resolved_path);
 
@@ -240,6 +240,7 @@ static std::vector<InfinibandDevice> listCxiDevices()
         });
     }
     return devices;
+#endif
 }
 
 #ifdef USE_UB
@@ -526,7 +527,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
         matrix_[ent.name] = ent;
     }
 #else
-    auto all_hca = listCxiDevices();
+    auto all_hca = listInfiniBandDevices(filter);
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }

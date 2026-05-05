@@ -331,6 +331,15 @@ static int runInitiator(TransferEngine* engine) {
               << segment_desc->buffers[0].addr << std::dec
               << " size=" << segment_desc->buffers[0].length;
 
+    for (auto buffer : segment_desc->buffers) {
+        for (int i = 0; i <= 4; i++) {
+            LOG(INFO) << "retry " << i << " selected device: " << segment_desc->topology.selectDevice(buffer.name, i);
+        }
+        for (int i = 0; i < buffer.rkey.size(); i++) {
+            LOG(INFO) << "remote device " << i << " has rkey " << buffer.rkey[i] << "\n";
+        }
+    }
+
     // Connection warmup: small transfer to establish endpoints
     LOG(INFO) << "Warming up connection...";
     {
@@ -452,7 +461,7 @@ static int runInitiator(TransferEngine* engine) {
 
     auto wall_t0 = std::chrono::steady_clock::now();
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back(workerFn, t, FLAGS_warmup * FLAGS_iterations,
+        threads.emplace_back(workerFn, t, FLAGS_warmup,
                              FLAGS_iterations, &results[t]);
     }
     for (auto& th : threads) th.join();

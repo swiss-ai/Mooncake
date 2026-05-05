@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define USE_CXI 1
-
 #include "transport/cxi_transport/cxi_endpoint.h"
 
 #include <glog/logging.h>

@@ -49,6 +49,9 @@ if (WITH_TE)
     if(USE_EFA)
         target_compile_definitions(engine PRIVATE USE_EFA)
     endif()
+    if (USE_CXI)
+        target_compile_definitions(engine PRIVATE USE_CXI)
+    endif()
 
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>

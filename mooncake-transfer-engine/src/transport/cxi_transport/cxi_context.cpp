@@ -647,8 +647,6 @@ int CxiContext::submitPostSend(
             slice->markFailed();
             continue;
         }
-        LOG(INFO) << "for transfer selected device " << device_id; 
-
 
         // no FI_VIRT_ADDR support on slingshot, must be offset of memory region
         slice->rdma.dest_addr -= peer_segment_desc->buffers[buffer_id].addr;
@@ -834,10 +832,6 @@ int CxiContext::submitSlicesOnPeer(
                                   entry.slice->rdma.dest_rkey,
                                   &entry.op_ctx->fi_ctx);
                 } else {
-                    // std::cout << "fi_write @ " << (void*) entry.slice->source_addr << 
-                    //     "\n length: " << entry.slice->length << 
-                    //     "\n dest key: " << entry.slice->rdma.dest_rkey << 
-                    //     "\n dst addr: " << (void*) entry.slice->rdma.dest_addr << "\n";
                     ret = fi_write(shared_ep_, (void*)entry.slice->source_addr,
                                    entry.slice->length, entry.local_desc,
                                    peer_fi_addr, entry.slice->rdma.dest_addr,

@@ -653,7 +653,7 @@ int CxiTransport::warmupSegment(const std::string& segment_name) {
     LOG(INFO) << "CxiTransport::warmupSegment('" << segment_name << "'): " << ok
               << "/" << n_pairs << " endpoints connected (" << fail
               << " failed) in " << elapsed << "s (" << context_list_.size()
-              << " local NICs × " << peer_paths.size() << " peer NICs)";
+              << " local NICs x " << peer_paths.size() << " peer NICs)";
     return fail == 0 ? 0 : ERR_ENDPOINT;
 }
 

@@ -63,7 +63,7 @@ class CxiTransport : public Transport {
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
 
-    const char* getName() const override { return "efa"; }
+    const char* getName() const override { return "cxi"; }
 
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location, bool remote_accessible,
