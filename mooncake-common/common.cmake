@@ -101,6 +101,25 @@ if (USE_EFA)
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
   message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
 endif()
+if (USE_CXI)
+  # Find libfabric headers and library; default to AWS EFA installer path
+  find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+    PATH_SUFFIXES include)
+  find_library(LIBFABRIC_LIBRARY fabric
+    PATH_SUFFIXES lib lib64)
+
+  if (NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(FATAL_ERROR "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY.")
+  endif()
+
+  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
+  include_directories(${LIBFABRIC_INCLUDE_DIR})
+  link_directories(${LIBFABRIC_LIB_DIR})
+  add_compile_definitions(USE_CXI)
+  message(STATUS "HPE CXI (libfabric) transport is enabled")
+  message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
+  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+endif()
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)

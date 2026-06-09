@@ -256,8 +256,22 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     auto policy = getReplicaPolicy();
 
     std::vector<std::vector<size_t>> nic_assignments(num_chunks);
-    int numa_node = std::stoi(resolved_name.substr(resolved_name.find(':') + 1));
-    LOG(INFO) << "numa node for this allocation is " << numa_node;
+
+    std::string nic = local_topology_->getHcaList().at(local_topology_->selectDevice(resolved_name));
+    LOG(INFO) << "for this allocation, selected NIC " << nic;
+    int id = -1;
+    for (int i = 0; i < context_list_.size(); i++) {
+        auto& entry = context_list_[i];
+        if (entry->deviceName() == nic) {
+            id = i;
+            break;
+        }
+    }
+    if (id == -1) {
+        LOG(ERROR) << "possible mismatch between context list devices and topology HCA names!";
+        return -1;
+    }
+    int numa_node = id;
 
     // implicit assumption here, the address and relative chunks all lie in the same numa node
     for (size_t ci = 0; ci < num_chunks; ci++) {
