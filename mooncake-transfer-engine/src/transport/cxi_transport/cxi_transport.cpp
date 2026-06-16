@@ -95,9 +95,6 @@ void CxiTransport::workerThreadFunc(int thread_id) {
             for (size_t cq_idx = 0; cq_idx < context->cqCount(); cq_idx++) {
                 int completed = context->pollCq(kPollBatchSize, cq_idx);
                 if (completed > 0) {
-                    if (cq_idx != 0) {
-                        LOG(INFO) << "polled from cq different from 0 WTF?";
-                    }
                     did_work = true;
                 }
             }
@@ -242,8 +239,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     std::string resolved_name;
     if (name == kWildcardLocation) {
         bool only_first_page = true;
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page); // check only first page
+        const std::vector<MemoryLocationEntry> entries = getMemoryLocation(addr, length, only_first_page); // check only first page
         if (entries.empty()) return -1;
         resolved_name = entries[0].location;
     } else {
@@ -260,7 +256,7 @@ int CxiTransport::registerLocalMemoryInternal(void* addr, size_t length,
     std::string nic = local_topology_->getHcaList().at(local_topology_->selectDevice(resolved_name));
     LOG(INFO) << "for this allocation, selected NIC " << nic;
     int id = -1;
-    for (int i = 0; i < context_list_.size(); i++) {
+    for (size_t i = 0; i < context_list_.size(); i++) {
         auto& entry = context_list_[i];
         if (entry->deviceName() == nic) {
             id = i;

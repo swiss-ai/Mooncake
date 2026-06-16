@@ -88,7 +88,7 @@ int CxiContext::construct(size_t num_cq_list, size_t max_cqe,
 
     // Get fabric info
     int ret =
-        fi_getinfo(FI_VERSION(2, 5), nullptr, nullptr, 0, hints_, &fi_info_);
+        fi_getinfo(fi_version(), nullptr, nullptr, 0, hints_, &fi_info_);
     if (ret) {
         LOG(ERROR) << "fi_getinfo failed for device " << device_name_ << ": "
                    << fi_strerror(-ret);
@@ -346,6 +346,8 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (hip_ret == hipSuccess && attributes.type == hipMemoryTypeDevice) {
         iface = FI_HMEM_ROCR;
         device_ordinal = attributes.device;
+        hipGetDevice(&current_device);
+        hipSetDevice(device_ordinal);
     }
 #endif
 
@@ -367,8 +369,10 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
                        << "): " << fi_strerror(-ret);
             return ERR_CONTEXT;
         }
-        #ifdef USE_CUDA 
+        #if defined(USE_CUDA)
             cudaSetDevice(current_device);
+        #elif defined(USE_HIP)
+            hipSetDevice(current_device);
         #endif
 
     } else {
@@ -641,11 +645,23 @@ int CxiContext::submitPostSend(
         if (CxiTransport::selectDevice(peer_segment_desc.get(),
                                        slice->rdma.dest_addr, slice->length,
                                        buffer_id, device_id)) {
-
-            LOG(ERROR) << "Cannot select device for dest_addr "
-                       << (void*)slice->rdma.dest_addr;
-            slice->markFailed();
-            continue;
+            // The cached peer descriptor may be stale: the remote can free
+            // and re-register buffers at new virtual addresses between
+            // iterations (e.g. a fresh per-iter H2D buffer). Force-refresh
+            // the segment descriptor once and retry before giving up.
+            // Mirrors the RDMA transport's retry-on-miss in worker_pool.cpp.
+            peer_segment_desc =
+                engine_.meta()->getSegmentDescByID(slice->target_id, true);
+            if (!peer_segment_desc ||
+                CxiTransport::selectDevice(peer_segment_desc.get(),
+                                           slice->rdma.dest_addr,
+                                           slice->length, buffer_id,
+                                           device_id)) {
+                LOG(ERROR) << "Cannot select device for dest_addr "
+                           << (void*)slice->rdma.dest_addr;
+                slice->markFailed();
+                continue;
+            }
         }
 
         // no FI_VIRT_ADDR support on slingshot, must be offset of memory region
