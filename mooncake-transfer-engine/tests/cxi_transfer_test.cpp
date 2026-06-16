@@ -46,7 +46,7 @@
 #include "transfer_engine.h"
 #include "transport/cxi_transport/cxi_transport.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_HIP)
 #include <cuda_alike.h>
 #endif
 
@@ -104,7 +104,7 @@ static void* allocateHugepage(size_t size, int node_id) {
 
 
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_HIP)
     static constexpr bool can_use_device = true;
 
     static void* allocateDevice(size_t size, int device) {
@@ -177,7 +177,7 @@ static int runTarget(TransferEngine* engine) {
                 return 1;
             }
         } else {
-#ifdef USE_CUDA 
+#if defined(USE_CUDA) || defined(USE_HIP) 
             int buf_device = i % 4;
             buf = allocateDevice(buf_bytes, buf_device);
             if (!buf) {
@@ -289,7 +289,7 @@ static int runInitiator(TransferEngine* engine) {
                 return 1;
             }
         } else {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_HIP)
             int tid_device = t % 4;
             recv_bufs[t] = allocateDevice(recv_bytes, tid_device);
             if (!recv_bufs[t]) {
@@ -519,7 +519,7 @@ static int runInitiator(TransferEngine* engine) {
             engine->unregisterLocalMemory(recv_bufs[t]);
             munmap(recv_bufs[t], recv_bytes);
         } else {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_HIP)
             bool result = checkDeviceMem(recv_bufs[t], t % 4, 42);
             if (!result) {
                 LOG(ERROR) << "transfer has corrupted data, expected to find 42";

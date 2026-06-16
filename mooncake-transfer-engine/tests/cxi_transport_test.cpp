@@ -25,6 +25,10 @@
 #include "transport/transport.h"
 #include "cuda_alike.h"
 
+#if defined(USE_CUDA) || defined(USE_HIP)
+    #define USE_GPU
+#endif
+
 using namespace mooncake;
 
 namespace mooncake {
@@ -35,7 +39,7 @@ static void *allocateMemoryPool(size_t size, int socket_id) {
 
 static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
 
-#ifdef USE_CUDA
+#ifdef USE_GPU
 static void *allocateMemoryPoolDevice(size_t size, int device) {
     void* devPtr = nullptr;
     cudaError_t err = cudaMalloc(&devPtr, size);
@@ -92,7 +96,7 @@ class CXITransportTest : public ::testing::Test {
         SegmentID segment_id;
     };
 
-    #ifdef USE_CUDA
+    #ifdef USE_GPU
 
     EngineSetup createEngineDevice(size_t buffer_size = 1ull << 30) {
         EngineSetup s;
@@ -113,7 +117,7 @@ class CXITransportTest : public ::testing::Test {
         s.addr = allocateMemoryPoolDevice(buffer_size, 0); // allocate mempool on cuda:0
         EXPECT_NE(s.addr, nullptr) << "allocateMemoryPool failed";
 
-        rc = s.engine->registerLocalMemory(s.addr, buffer_size, "cuda:0");
+        rc = s.engine->registerLocalMemory(s.addr, buffer_size, GPU_PREFIX + "0");
         EXPECT_EQ(rc, 0) << "registerLocalMemory failed";
 
         // Use actual RPC address (P2PHANDSHAKE picks a random port)
@@ -256,7 +260,7 @@ TEST_F(CXITransportTest, LoopbackWrite) {
     destroyEngine(setup);
 }
 
-#ifdef USE_CUDA
+#ifdef USE_GPU
 TEST_F(CXITransportTest, LoopbackWriteDevice) {
     cudaSetDevice(0);
     auto setup = createEngineDevice();
@@ -314,7 +318,7 @@ TEST_F(CXITransportTest, WriteAndRead) {
 }
 
 
-#ifdef USE_CUDA
+#ifdef USE_GPU
 TEST_F(CXITransportTest, WriteAndReadDevice) {
     cudaSetDevice(0);
     auto setup = createEngineDevice();
