@@ -398,7 +398,6 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
         return ERR_CONTEXT;
     }
     mrMeta.key = fi_mr_key(mrMeta.mr);
-    // LOG(INFO) << "cxi mem region @ " << addr << " len: " << length << " key: " << mrMeta.key;
     return 0;
 }
 

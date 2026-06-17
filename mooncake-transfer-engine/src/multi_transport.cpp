@@ -390,6 +390,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_CXI
     else if (std::string(proto) == "cxi") {
         transport = new CxiTransport();
+    }
 #endif
 #ifdef USE_SUNRISE
     else if (std::string(proto) == "sunrise_link") {
