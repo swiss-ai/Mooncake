@@ -15,7 +15,6 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
-echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:/usr/local/lib
@@ -126,25 +125,22 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
-if [ "$BUILD_WITH_EP" = "1" ]; then
-    echo "Building Mooncake PG"
-    cd mooncake-pg
-    if [ -z "$EP_TORCH_VERSIONS" ]; then
-        python setup.py build_ext --build-lib .
-    else
-        for version in ${EP_TORCH_VERSIONS//;/ }; do
-            cuda_major=${CUDA_VERSION%%.*}
-            if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
-            else
-                pip install torch==$version
-            fi
-            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
-        done
+# CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+# If EP/PG .so files were staged inside the build directory, preserve them in a
+# temporary location so they survive the cleanup.
+CUDA_EP_STAGING_TEMP=""
+if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+        CUDA_EP_STAGING_TEMP=$(mktemp -d)
+        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
+        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
     fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
-    cd ..
+    echo "Freeing disk space: removing build directory (artifacts already copied)"
+    rm -rf "${BUILD_DIR}/"
+    # Point the injection step to the preserved copy (if any).
+    if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+        CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
+    fi
 fi
 
 if [ "$NPU_BUILD" = "1" ]; then
@@ -348,6 +344,9 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libamdhip64.so* \
+    --exclude libhsa-runtime64.so* \
+    --exclude librocprofiler-register.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \
@@ -390,8 +389,35 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+
+# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
+# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
+# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        echo "Injecting CUDA extension .so files into repaired wheel..."
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
+            if [ -f "$so_file" ]; then
+                echo "  Adding $(basename "$so_file")"
+                cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
+            fi
+        done
+        rm "$REPAIRED_WHEEL"
+        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
+else
+    echo "No EP/PG staging directory found (${CUDA_EP_STAGING_DIR}); skipping CUDA extension injection"
 fi
 
+# Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
+if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+    rm -rf "$CUDA_EP_STAGING_TEMP"
+fi
 
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.

@@ -160,7 +160,7 @@ int CxiContext::construct(size_t num_cq_list, size_t max_cqe,
 
     ret = buildSharedEndpoint(globalConfig().max_wr, 16);
     if (ret) {
-        LOG(ERROR) << "EfaContext::construct: buildSharedEndpoint failed for " << device_name_;
+        LOG(ERROR) << "CxiContext::construct: buildSharedEndpoint failed for " << device_name_;
         return ret;
     }
 
@@ -177,7 +177,7 @@ int CxiContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
 
     shared_cq_ = cq_list_.empty() ? nullptr : cq_list_[0];
     if (!shared_cq_) {
-        LOG(ERROR) << "EfaContext::buildSharedEndpoint: no CQ available";
+        LOG(ERROR) << "CxiContext::buildSharedEndpoint: no CQ available";
         return ERR_CONTEXT;
     }
     max_wr_depth_ = static_cast<int>(max_wr);
@@ -309,7 +309,7 @@ int CxiContext::registerMemoryRegionInternal(void *addr, size_t length,
         LOG(ERROR) << "Buffer length " << length
                    << " exceeds device max_mr_size "
                    << globalConfig().max_mr_size
-                   << ". Use EfaTransport::registerLocalMemory() which "
+                   << ". Use CxiTransport::registerLocalMemory() which "
                       "auto-splits large buffers.";
         return ERR_CONTEXT;
     } else if (!shared_ep_) {

@@ -62,7 +62,7 @@ int CxiEndpoint::setupConnectionsByActive() {
                                                peer_fi_addr_);
         if (ret != 0) return ret;
         status_.store(CONNECTED, std::memory_order_release);
-        LOG(INFO) << "EFA loopback connection established: " << toString();
+        LOG(INFO) << "CXI loopback connection established: " << toString();
         return 0;
     }
 
@@ -84,7 +84,7 @@ int CxiEndpoint::setupConnectionsByActive() {
     if (rc) return rc;
 
     if (peer_desc.cxi_addr.empty()) {
-        LOG(ERROR) << "Peer did not provide EFA address in handshake";
+        LOG(ERROR) << "Peer did not provide CXI address in handshake";
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -92,7 +92,7 @@ int CxiEndpoint::setupConnectionsByActive() {
     if (rc != 0) return rc;
 
     status_.store(CONNECTED, std::memory_order_release);
-    VLOG(1) << "EFA connection established: " << toString()
+    VLOG(1) << "CXI connection established: " << toString()
             << " peer_fi_addr=" << peer_fi_addr_;
     return 0;
 }
